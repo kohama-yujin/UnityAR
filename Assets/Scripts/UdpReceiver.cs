@@ -10,7 +10,7 @@ public class UdpReceiver : MonoBehaviour
 {
     public int listenPort = 12345;
     public Renderer targetRenderer; // PlaneなどのRendererをInspectorで指定
-    public Transform cameraTransform;
+    public Camera targetCamera;
 
     // タイムアウト等の設定（必要に応じ調整）
     public int socketReceiveTimeoutMs = 2000;      // UDP受信ソケットのブロックタイムアウト
@@ -28,8 +28,18 @@ public class UdpReceiver : MonoBehaviour
     // キャッシュ（Texture / Material）を使ってGCとマテリアル複製を抑える
     private Texture2D tex;
     private Material cachedMaterial;
-    // latest camera position received from UDP (in meters)
+
+    // 垂直視野角
+    private float latestVerticalFov = 0f;
+    // Unityの座標系
+    private Matrix4x4 worldShift = new Matrix4x4();
+    // PythonからUnityへの変換行列
+    private Matrix4x4 ConvertPyToUnity = Matrix4x4.identity;
+
+    // 最新のカメラ位置
     private Vector3 latestCameraPos = Vector3.zero;
+    // 最新のカメラ回転
+    private Matrix4x4 latestCameraRot = Matrix4x4.identity;
 
     void Start()
     {
@@ -49,6 +59,16 @@ public class UdpReceiver : MonoBehaviour
             // マテリアルをキャッシュして毎フレームの material プロパティ参照を避ける
             cachedMaterial = targetRenderer.material;
         }
+        
+        if (targetCamera == null)
+        {
+            Debug.LogError("targetCamera が設定されていません。");
+        }
+        
+        worldShift.SetRow(0, new Vector4(0f, 1f, 0f, 0f));
+        worldShift.SetRow(1, new Vector4(0f, 0f, 1f, 0f));
+        worldShift.SetRow(2, new Vector4(-1f, 0f, 0f, 0f));
+        worldShift.SetRow(3, new Vector4(0f, 0f, 0f, 1f));
 
         Debug.Log($"UdpReceiver: listening on port {listenPort}");
     }
@@ -73,18 +93,18 @@ public class UdpReceiver : MonoBehaviour
 
                 if (firstPacket == null || firstPacket.Length == 0) continue;
 
-                // バイト数で「ヘッダ」を判断
-                if (firstPacket.Length == 12 || firstPacket.Length == 28)
+                // バイト数でフォーマットを判定
+                if (firstPacket.Length == 12 || firstPacket.Length == 44 || firstPacket.Length == 52)
                 {
                     // Big-endian形式
-                    uint format = ((uint)firstPacket[0] << 24) | ((uint)firstPacket[1] << 16) | ((uint)firstPacket[2] << 8) | firstPacket[3];
+                    uint format = EndianConverter.ReadUInt32BE(firstPacket, 0);
 
                     // 形式ごとに処理を分岐
                     if (format == 1)
                     {
                         // 画像フレームのヘッダ
-                        uint frameId = ((uint)firstPacket[4] << 24) | ((uint)firstPacket[5] << 16) | ((uint)firstPacket[6] << 8) | firstPacket[7];
-                        int numPackets = (int)(((uint)firstPacket[8] << 24) | ((uint)firstPacket[9] << 16) | ((uint)firstPacket[10] << 8) | firstPacket[11]);
+                        uint frameId = EndianConverter.ReadUInt32BE(firstPacket, 4);
+                        int numPackets = (int)EndianConverter.ReadUInt32BE(firstPacket, 8);
 
                         if (numPackets <= 0)
                             continue;
@@ -113,14 +133,14 @@ public class UdpReceiver : MonoBehaviour
 
                             // パケットの最初の12B
                             // pkt: format(4B) + frame_id(4B) + seq(4B) + chunk
-                            uint pktFormat = ((uint)pkt[0] << 24) | ((uint)pkt[1] << 16) | ((uint)pkt[2] << 8) | pkt[3];
+                            uint pktFormat = EndianConverter.ReadUInt32BE(pkt, 0);
                             if (pktFormat != 1)
                             {
                                 // 画像フレーム以外のパケットが混入した場合は無視
                                 continue;
                             }
-                            uint pktFrameId = ((uint)pkt[4] << 24) | ((uint)pkt[5] << 16) | ((uint)pkt[6] << 8) | pkt[7];
-                            int seq = (int)(((uint)pkt[8] << 24) | ((uint)pkt[9] << 16) | ((uint)pkt[10] << 8) | pkt[11]);
+                            uint pktFrameId = EndianConverter.ReadUInt32BE(pkt, 4);
+                            int seq = EndianConverter.ReadInt32BE(pkt, 8);
                             if (pktFrameId != frameId) 
                             {
                                 // 遅れて届いた前のフレームのパケット（遅延到着など）なら無視
@@ -177,41 +197,55 @@ public class UdpReceiver : MonoBehaviour
                     }
                     else if (format == 2)
                     {
-                        // カメラ位置情報: pkt -> format(4B) + x(8B) + y(8B) + z(8B)
+                        // カメラの初期パラメータ（座標軸と垂直視野角）
+                        float[] values = new float[9];
+                        for (int i = 0; i < 9; i++)
+                            values[i] = EndianConverter.ReadFloatBE(firstPacket, 4 + i * 4);
 
-                        // big-endian double を読む
-                        double ReadDoubleBE(byte[] buf, int off)
-                        {
-                            byte[] tmp = new byte[8];
-                            // reverse order for BitConverter (little-endian system)
-                            tmp[0] = buf[off + 7];
-                            tmp[1] = buf[off + 6];
-                            tmp[2] = buf[off + 5];
-                            tmp[3] = buf[off + 4];
-                            tmp[4] = buf[off + 3];
-                            tmp[5] = buf[off + 2];
-                            tmp[6] = buf[off + 1];
-                            tmp[7] = buf[off + 0];
-                            return BitConverter.ToDouble(tmp, 0);
-                        }
+                        // カメラの座標軸
+                        Matrix4x4 camShift = Matrix4x4.identity;
+                        camShift.m00 = values[0]; camShift.m01 = values[1]; camShift.m02 = values[2];
+                        camShift.m10 = values[3]; camShift.m11 = values[4]; camShift.m12 = values[5];
+                        camShift.m20 = values[6]; camShift.m21 = values[7]; camShift.m22 = values[8];
 
-                        // 座標をメートル単位で取得
-                        double x = ReadDoubleBE(firstPacket, 4) / 100.0;
-                        double y = ReadDoubleBE(firstPacket, 12) / 100.0;
-                        double z = ReadDoubleBE(firstPacket, 20) / 100.0;
+                        // 座標変換行列
+                        ConvertPyToUnity = worldShift * camShift;
 
-                        // Unity座標系に変換
-                        double unity_x = x;
-                        double unity_y = -z;
-                        double unity_z = -y;
-
-                        // Unity の Vector3 に保存（float 精度に変換）
                         lock (lockObj)
                         {
-                            latestCameraPos = new Vector3((float)unity_x, (float)unity_y, (float)unity_z);
+                            // 垂直視野角
+                            latestVerticalFov = EndianConverter.ReadFloatBE(firstPacket, 40);
+                        }
+                    }
+                    else if (format == 3)
+                    {
+                        // カメラの外部パラメータ
+                        float[] values = new float[12];
+                        for (int i = 0; i < 12; i++)
+                            values[i] = EndianConverter.ReadFloatBE(firstPacket, 4 + i * 4);
+
+                        // 回転行列
+                        Matrix4x4 R = Matrix4x4.identity;
+                        R.m00 = values[0]; R.m01 = values[1]; R.m02 = values[2];
+                        R.m10 = values[3]; R.m11 = values[4]; R.m12 = values[5];
+                        R.m20 = values[6]; R.m21 = values[7]; R.m22 = values[8];
+
+                        // 位置
+                        Vector3 t = new Vector3(
+                            values[9] / 100,
+                            values[10] / 100,
+                            values[11] / 100
+                        );
+
+                        // Unity座標系に変換（右手→左手）
+                        lock (lockObj)
+                        {
+                            latestCameraRot = ConvertPyToUnity * R * ConvertPyToUnity.transpose;
+                            latestCameraPos = ConvertPyToUnity.MultiplyPoint(t);
                         }
 
-                        Debug.Log($"UdpReceiver: Received camera pos x={x:F3}m y={y:F3}m z={z:F3}m");
+                        Debug.Log($"{latestCameraPos}");
+                        Debug.Log($"{latestCameraRot}");
                     }
                     else
                     {
@@ -234,14 +268,24 @@ public class UdpReceiver : MonoBehaviour
 
     void Update()
     {
+        // 視野角を更新
+        float v_fov;
+        lock(lockObj)
+        {
+            v_fov = latestVerticalFov;
+        }
+        targetCamera.fieldOfView = v_fov;
+
         // カメラ位置を更新
         Vector3 pos;
+        Matrix4x4 rot;
         lock(lockObj)
         {
             pos = latestCameraPos;
-        }
-        
-        cameraTransform.localPosition = pos;
+            rot = latestCameraRot;
+        }        
+        targetCamera.transform.localPosition = pos;
+        targetCamera.transform.localRotation = rot.rotation;
 
         // 受信キューから最新の画像データを取り出す
         byte[] img = null;

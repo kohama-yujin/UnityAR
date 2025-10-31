@@ -520,7 +520,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   listenPort: 12345
   targetRenderer: {fileID: 1751822494}
-  cameraTransform: {fileID: 330585546}
+  targetCamera: {fileID: 330585545}
   socketReceiveTimeoutMs: 2000
   frameReceiveTimeoutMs: 1500
 --- !u!1 &1751822491
